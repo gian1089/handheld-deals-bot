@@ -36,6 +36,10 @@ EXCLUDE = [
     "cover", "custodia", "case", "pellicola", "vetro", "grip", "guscio",
     "stand", "dock", "caricabatterie", "ricambi", "ricambio", "solo scatola",
     "vuota", "scatola vuota", "adesivi", "skin", "pad ", "memory", "scheda",
+    # accessori in altre lingue (Vinted e' pieno di annunci FR/DE/ES)
+    "coque", "carcasa", "funda", "etui", "étui", "housse", "pochette",
+    "hülle", "hulle", "tragetasche", "joystick", "controllers",
+    "chargeur", "caricatore", "sticker",
 ]
 
 # Fonti attive (eBay si disattiva da solo se mancano le chiavi)
