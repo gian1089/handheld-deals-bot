@@ -4,7 +4,7 @@
 Bot offerte console handheld -> notifiche su Telegram.
 
 Fonti:
-  - Vinted   (API interna, gratis)
+  - Vinted   (API interna, gratis) con filtro feedback venditore
   - eBay     (API ufficiale, gratis - si attiva solo con le chiavi)
   - Amazon   (nuovo + usato) tramite il feed RSS di CamelCamelCamel
 
@@ -41,6 +41,9 @@ EXCLUDE = [
     "hülle", "hulle", "tragetasche", "joystick", "controllers",
     "chargeur", "caricatore", "sticker",
 ]
+
+# Vinted: feedback minimo del venditore. 1 = scarta chi ha 0 feedback. 0 = disabilita.
+VINTED_MIN_FEEDBACK = 1
 
 # Fonti attive per le ricerche per-keyword (eBay si disattiva da solo se mancano le chiavi)
 SOURCES = {"ebay": True, "vinted": True}
@@ -180,13 +183,47 @@ def search_ebay(search):
 
 
 # ---------------------------------------------------------------------------
-# Fonte: VINTED (API interna)
+# Fonte: VINTED (API interna) + feedback venditore
 # ---------------------------------------------------------------------------
+_vinted_session = {"s": None}
+_vinted_feedback_cache = {}
+
+
+def get_vinted_session():
+    """Sessione condivisa con cookie, riusata per annunci e profili venditore."""
+    if _vinted_session["s"] is None:
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA, "Accept": "application/json"})
+        try:
+            s.get("https://www.vinted.it/", timeout=HTTP_TIMEOUT)
+        except requests.RequestException:
+            pass
+        _vinted_session["s"] = s
+    return _vinted_session["s"]
+
+
+def vinted_user_feedback(user_id):
+    """Numero di feedback del venditore. None se non determinabile (fail-open)."""
+    if not user_id:
+        return None
+    if user_id in _vinted_feedback_cache:
+        return _vinted_feedback_cache[user_id]
+    fb = None
+    try:
+        s = get_vinted_session()
+        r = s.get(f"https://www.vinted.it/api/v2/users/{user_id}",
+                  timeout=HTTP_TIMEOUT)
+        if r.status_code == 200:
+            fb = (r.json().get("user") or {}).get("feedback_count")
+    except (requests.RequestException, ValueError):
+        fb = None
+    _vinted_feedback_cache[user_id] = fb
+    return fb
+
+
 def search_vinted(search):
     out = []
-    s = requests.Session()
-    s.headers.update({"User-Agent": UA, "Accept": "application/json"})
-    s.get("https://www.vinted.it/", timeout=HTTP_TIMEOUT)  # cookie di sessione
+    s = get_vinted_session()
     r = s.get(
         "https://www.vinted.it/api/v2/catalog/items",
         params={
@@ -207,7 +244,13 @@ def search_vinted(search):
                 price = parse_decimal(price.get("amount"))
             else:
                 price = parse_decimal(price)
-            out.append({"id": uid, "title": title, "url": url, "price": price})
+            user = it.get("user") or {}
+            out.append({
+                "id": uid, "title": title, "url": url, "price": price,
+                "seller_id": user.get("id"),
+                # a volte il feedback e' gia' nell'oggetto user
+                "feedback": user.get("feedback_count"),
+            })
         except Exception as e:  # noqa: BLE001
             print(f"  ! Vinted parse: {e}")
     return out
@@ -257,6 +300,7 @@ def main():
     seen = load_seen()
     first_run = len(seen) == 0
     new_count = 0
+    skipped_feedback = 0
 
     # --- Ricerche per keyword su Vinted/eBay ---
     for search in SEARCHES:
@@ -277,6 +321,16 @@ def main():
                     continue
                 if d["price"] is None or d["price"] > search["max_price"]:
                     continue
+
+                # Filtro feedback venditore (solo Vinted)
+                if (name == "vinted" and VINTED_MIN_FEEDBACK and not first_run):
+                    fb = d.get("feedback")
+                    if fb is None:
+                        fb = vinted_user_feedback(d.get("seller_id"))
+                    if fb is not None and fb < VINTED_MIN_FEEDBACK:
+                        skipped_feedback += 1
+                        continue
+
                 deal = {
                     "title": d["title"],
                     "price": d["price"],
@@ -313,6 +367,8 @@ def main():
 
     save_seen(seen)
 
+    if skipped_feedback:
+        print(f"Scartati per feedback venditore 0: {skipped_feedback}.")
     if first_run:
         print(f"Primo avvio: registrati {new_count} elementi senza notifiche.")
     else:
