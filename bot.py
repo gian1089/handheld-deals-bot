@@ -3,10 +3,13 @@
 """
 Bot offerte console handheld -> notifiche su Telegram.
 
-Controlla Subito, eBay e Vinted per le ricerche configurate sotto,
-e invia su Telegram SOLO gli annunci nuovi (mai visti prima).
-Non risponde a comandi: e' un "notificatore", quindi non deve girare
-sempre. Lo lancia GitHub Actions a intervalli (vedi .github/workflows).
+Fonti:
+  - Vinted   (API interna, gratis)
+  - eBay     (API ufficiale, gratis - si attiva solo con le chiavi)
+  - Amazon   (nuovo + usato) tramite il feed RSS di CamelCamelCamel
+
+Invia su Telegram SOLO gli annunci/alert nuovi (mai visti prima).
+Non risponde a comandi: lo lancia GitHub Actions a intervalli.
 """
 
 import os
@@ -15,14 +18,11 @@ import json
 import time
 import base64
 import requests
+import xml.etree.ElementTree as ET
 
 # ---------------------------------------------------------------------------
-# 1) COSA CERCARE  -- modifica liberamente questa lista
+# 1) COSA CERCARE su Vinted/eBay  -- modifica liberamente
 # ---------------------------------------------------------------------------
-# query     = testo cercato sui siti
-# max_price = prezzo massimo in euro (annunci sopra vengono ignorati)
-# match     = il titolo deve contenere almeno una di queste stringhe
-#             (in minuscolo) -> serve a tagliare accessori e annunci sbagliati
 SEARCHES = [
     {"query": "ROG Xbox Ally X",      "max_price": 850, "match": ["ally x"]},
     {"query": "ROG Ally Z1 Extreme",  "max_price": 520, "match": ["ally"]},
@@ -42,22 +42,23 @@ EXCLUDE = [
     "chargeur", "caricatore", "sticker",
 ]
 
-# Fonti attive (eBay si disattiva da solo se mancano le chiavi)
-SOURCES = {"subito": True, "ebay": True, "vinted": True}
+# Fonti attive per le ricerche per-keyword (eBay si disattiva da solo se mancano le chiavi)
+SOURCES = {"ebay": True, "vinted": True}
 
 SEEN_FILE = "seen.json"
-MAX_SEEN = 3000          # quanti ID "gia' visti" tenere in memoria
+MAX_SEEN = 3000
 HTTP_TIMEOUT = 20
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 # ---------------------------------------------------------------------------
-# Segreti (impostati come GitHub Actions Secrets, NON nel codice)
+# Segreti (GitHub Actions Secrets, NON nel codice)
 # ---------------------------------------------------------------------------
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 EBAY_ID = os.environ.get("EBAY_CLIENT_ID", "").strip()
 EBAY_SECRET = os.environ.get("EBAY_CLIENT_SECRET", "").strip()
+CAMEL_RSS_URL = os.environ.get("CAMEL_RSS_URL", "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -68,20 +69,6 @@ def parse_decimal(s):
     try:
         return int(float(s))
     except (TypeError, ValueError):
-        return None
-
-
-def parse_it_price(s):
-    """Per Subito: formato italiano ('1.299,00' -> 1299)."""
-    if s is None:
-        return None
-    s = re.sub(r"[^\d.,]", "", str(s))
-    if not s:
-        return None
-    s = s.replace(".", "").replace(",", ".")
-    try:
-        return int(float(s))
-    except ValueError:
         return None
 
 
@@ -111,12 +98,14 @@ def save_seen(seen):
 
 
 def telegram_send(deal):
-    text = (
-        f"🎮 <b>{deal['title']}</b>\n"
-        f"💶 {deal['price']} €\n"
-        f"🔎 {deal['source']} · <i>{deal['query']}</i>\n"
-        f"{deal['url']}"
-    )
+    lines = [f"🎮 <b>{deal['title']}</b>"]
+    price = deal.get("price")
+    if price not in (None, "", 0):
+        lines.append(f"💶 {price} €")
+    lines.append(f"🔎 {deal['source']} · <i>{deal['query']}</i>")
+    lines.append(deal["url"])
+    text = "\n".join(lines)
+
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {
         "chat_id": TG_CHAT,
@@ -130,42 +119,6 @@ def telegram_send(deal):
             print(f"  ! Telegram {r.status_code}: {r.text[:200]}")
     except requests.RequestException as e:
         print(f"  ! Telegram errore: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Fonte: SUBITO
-# ---------------------------------------------------------------------------
-def search_subito(search):
-    out = []
-    params = {
-        "q": search["query"],
-        "qso": "true",       # cerca nel titolo
-        "shp": "true",
-        "sort": "datedesc",  # piu' recenti prima
-        "lim": "30",
-        "start": "0",
-        "t": "s",            # in vendita
-    }
-    headers = {"User-Agent": UA, "Accept": "application/json"}
-    r = requests.get("https://hades.subito.it/v1/search/items",
-                     params=params, headers=headers, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    for ad in r.json().get("ads", []):
-        try:
-            uid = "subito:" + str(ad.get("urn") or ad.get("id"))
-            title = ad.get("subject", "")
-            url = (ad.get("urls", {}) or {}).get("default", "")
-            price = None
-            for feat in ad.get("features", []):
-                if feat.get("uri") == "/price":
-                    vals = feat.get("values", [])
-                    if vals:
-                        price = parse_it_price(vals[0].get("value"))
-                    break
-            out.append({"id": uid, "title": title, "url": url, "price": price})
-        except Exception as e:  # noqa: BLE001
-            print(f"  ! Subito parse: {e}")
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -227,14 +180,13 @@ def search_ebay(search):
 
 
 # ---------------------------------------------------------------------------
-# Fonte: VINTED (API interna, puo' rompersi - isolata cosi' non blocca il resto)
+# Fonte: VINTED (API interna)
 # ---------------------------------------------------------------------------
 def search_vinted(search):
     out = []
     s = requests.Session()
     s.headers.update({"User-Agent": UA, "Accept": "application/json"})
-    # prima visita per ottenere i cookie di sessione
-    s.get("https://www.vinted.it/", timeout=HTTP_TIMEOUT)
+    s.get("https://www.vinted.it/", timeout=HTTP_TIMEOUT)  # cookie di sessione
     r = s.get(
         "https://www.vinted.it/api/v2/catalog/items",
         params={
@@ -262,10 +214,31 @@ def search_vinted(search):
 
 
 # ---------------------------------------------------------------------------
+# Fonte: CAMELCAMELCAMEL (Amazon nuovo+usato via feed RSS)
+# ---------------------------------------------------------------------------
+def fetch_camel():
+    """Legge il feed RSS degli alert CamelCamelCamel.
+    Gli alert scattano gia' sotto la soglia impostata su CCC, quindi
+    qui non serve filtrare per prezzo o keyword: si rigira tutto il nuovo."""
+    if not CAMEL_RSS_URL:
+        return []
+    out = []
+    r = requests.get(CAMEL_RSS_URL, headers={"User-Agent": UA},
+                     timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    root = ET.fromstring(r.content)
+    for item in root.iter("item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        guid = (item.findtext("guid") or link or title).strip()
+        out.append({"id": "camel:" + guid, "title": title, "url": link})
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 SOURCE_FUNCS = {
-    "subito": search_subito,
     "ebay": search_ebay,
     "vinted": search_vinted,
 }
@@ -278,11 +251,14 @@ def main():
     if not (EBAY_ID and EBAY_SECRET):
         SOURCES["ebay"] = False
         print("eBay disattivato (chiavi mancanti).")
+    if not CAMEL_RSS_URL:
+        print("CamelCamelCamel disattivato (CAMEL_RSS_URL mancante).")
 
     seen = load_seen()
     first_run = len(seen) == 0
     new_count = 0
 
+    # --- Ricerche per keyword su Vinted/eBay ---
     for search in SEARCHES:
         for name, enabled in SOURCES.items():
             if not enabled:
@@ -296,13 +272,11 @@ def main():
             for d in results:
                 if d["id"] in seen:
                     continue
-                seen.add(d["id"])  # marca come visto comunque (anche se scartato)
-
+                seen.add(d["id"])
                 if not title_ok(d["title"], search):
                     continue
                 if d["price"] is None or d["price"] > search["max_price"]:
                     continue
-
                 deal = {
                     "title": d["title"],
                     "price": d["price"],
@@ -310,17 +284,37 @@ def main():
                     "source": name.capitalize(),
                     "query": search["query"],
                 }
-                # al primissimo avvio non spammare: registra e basta
                 if not first_run:
                     telegram_send(deal)
-                    time.sleep(1)  # rispetta i limiti di Telegram
+                    time.sleep(1)
                 new_count += 1
                 print(f"[{name}] NUOVO: {d['price']}€ - {d['title'][:60]}")
+
+    # --- Amazon nuovo+usato via CamelCamelCamel (feed unico) ---
+    try:
+        for d in fetch_camel():
+            if d["id"] in seen:
+                continue
+            seen.add(d["id"])
+            deal = {
+                "title": d["title"],
+                "price": "",  # il prezzo e' gia' nel titolo dell'alert CCC
+                "url": d["url"],
+                "source": "Amazon (Camel)",
+                "query": "price watch",
+            }
+            if not first_run:
+                telegram_send(deal)
+                time.sleep(1)
+            new_count += 1
+            print(f"[camel] NUOVO: {d['title'][:70]}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[camel] errore: {e}")
 
     save_seen(seen)
 
     if first_run:
-        print(f"Primo avvio: registrati {new_count} annunci senza notifiche.")
+        print(f"Primo avvio: registrati {new_count} elementi senza notifiche.")
     else:
         print(f"Fatto. Notifiche inviate: {new_count}.")
 
