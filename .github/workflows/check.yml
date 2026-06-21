@@ -1,4 +1,4 @@
-name: Handheld Deals Bot
+ame: Handheld Deals Bot
 
 on:
   schedule:
@@ -31,6 +31,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
           EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
+          CAMEL_RSS_URL: ${{ secrets.CAMEL_RSS_URL }}
         run: python bot.py
 
       - name: Salva gli annunci gia' visti
